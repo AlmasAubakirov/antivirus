@@ -5,21 +5,29 @@ import hashlib
 import requests
 import schedule
 import time
+from api import update
 from datetime import datetime
 import tkinter as tk
-from tkinter import filedialog, messagebox
+from tkinter import filedialog, messagebox, scrolledtext
 from PIL import Image, ImageTk
 from tkinter import ttk
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+import psutil
+from matplotlib.animation import FuncAnimation
+from rabbitmq_client import RabbitMQClient
+import time
 
+ani = None
 # Подключение к базе данных
 def connect_db():
     try:
         conn = psycopg2.connect(
-            dbname='antivirus_db',  # Имя базы данных
-            user='postgres',    # Имя пользователя
-            password='123456P@$$', # Пароль
-            host='localhost',     # Хост
-            port='5432'                    # Порт по умолчанию
+            dbname='antivirus_db',
+            user='postgres',
+            password='123456P@$$',
+            host='localhost',
+            port='5432'
         )
         return conn
     except Exception as e:
@@ -34,8 +42,8 @@ def get_signatures():
     try:
         with conn.cursor() as cur:
             cur.execute("SELECT signature FROM signatures;")
-            signatures = cur.fetchall()  # Получаем все сигнатуры
-            return [sig[0] for sig in signatures]  # Возвращаем список хешей
+            signatures = cur.fetchall()
+            return [sig[0] for sig in signatures]
     except Exception as e:
         messagebox.showerror("Error", f"Не удалось получить сигнатуры: {e}")
         return []
@@ -56,10 +64,9 @@ def is_infected(file_path):
 
 # Перемещение файла в карантин
 def quarantine_file(file_path):
-    quarantine_dir = "КАРАНТИН"
+    quarantine_dir = "Quarantine"
     if not os.path.exists(quarantine_dir):
         os.makedirs(quarantine_dir)
-    
     try:
         shutil.copy(file_path, quarantine_dir)
         insert_quarantine_log(file_path)
@@ -74,7 +81,7 @@ def insert_quarantine_log(file_path):
         return
     try:
         date_quarantined = datetime.now()
-        status = 'Карантин'
+        status = 'Quarantine'
         with conn.cursor() as cur:
             cur.execute("""
                 INSERT INTO quarantine (file_path, date_quarantined, status)
@@ -91,14 +98,12 @@ def scan_files(directory):
     total_files_scanned = 0
     threats_found = 0
     start_time = datetime.now()
-
-    # Создаем и настраиваем полосу выполнения
     progress_bar = ttk.Progressbar(main_content, orient="horizontal", mode="determinate")
     progress_bar.pack(pady=20, fill='x')
     
-    # Получаем общее количество файлов для настройки полосы выполнения
     total_files = sum([len(files) for _, _, files in os.walk(directory)])
-    progress_bar["maximum"] = total_files  # Устанавливаем максимальное значение
+    progress_bar["maximum"] = total_files
+    
 
     for root, _, files in os.walk(directory):
         for file in files:
@@ -107,17 +112,27 @@ def scan_files(directory):
             if is_infected(file_path):
                 quarantine_file(file_path)
                 threats_found += 1
-            
-            progress_bar["value"] = total_files_scanned  # Обновляем значение полосы выполнения
-            root.update_idletasks()  # Обновляем интерфейс
-
+            progress_bar["value"] = total_files_scanned
+            root.update_idletasks()
+    
+   
+    while True:
+        try:
+            a = {i: psutil.Process(i).name() for i in psutil.pids()}
+            for i in a:
+                if 'virus.exe' in a[i]:
+                    print(f"ALERT: PID={i}")
+                    psutil.Process(i).terminate()
+                    threats_found += 1
+            time.sleep(5)
+        except:
+            pass
     end_time = datetime.now()
     action_taken = "Файлы перемещены в карантин"
+    
     insert_scan_history(start_time, end_time, total_files_scanned, threats_found, action_taken)
-
-    progress_bar.destroy()  # Удаляем полосу выполнения после завершения сканирования
+    progress_bar.destroy()
     messagebox.showinfo("Scan Complete", f"Всего файлов: {total_files_scanned}, Найдено угроз: {threats_found}")
-
 
 # Запись истории сканирования
 def insert_scan_history(start_time, end_time, total_files_scanned, threats_found, action_taken):
@@ -136,132 +151,274 @@ def insert_scan_history(start_time, end_time, total_files_scanned, threats_found
     finally:
         conn.close()
 
-# Получение сигнатур вирусов через API VirusTotal
-def fetch_signatures_from_api():
-    api_key = os.getenv('VT_API_KEY')  # Используйте свой API ключ VirusTotal
-    url = 'https://www.virustotal.com/vtapi/v2/file/report'
-    params = {
-        'apikey': api_key,
-        'resource': 'malware_hash'  # Список хешей, которые необходимо проверить
-    }
-    
-    try:
-        response = requests.get(url, params=params)
-        if response.status_code == 200:
-            data = response.json()
-            return extract_signatures(data)  # Обработка полученных данных
-        else:
-            print(f"[ERROR] Ошибка API: {response.status_code}")
-            return []
-    except Exception as e:
-        print(f"[ERROR] Не удалось подключиться к API: {e}")
-        return []
-
-# Извлечение сигнатур из данных API
-def extract_signatures(data):
-    signatures = []
-    if 'scans' in data:
-        for scan in data['scans']:
-            if data['scans'][scan]['detected']:
-                signatures.append(data['md5'])  # Добавляем хеш вируса в список
-    return signatures
-
-# Обновление базы данных новыми сигнатурами
-def update_signatures_in_db(signatures):
-    conn = connect_db()
-    if conn is None:
-        return
-    
-    try:
-        with conn.cursor() as cur:
-            for signature in signatures:
-                cur.execute("""
-                    INSERT INTO signatures (signature)
-                    VALUES (%s)
-                    ON CONFLICT (signature) DO NOTHING;
-                """, (signature,))
-        conn.commit()
-        print(f"[INFO] Обновлено {len(signatures)} сигнатур в базе данных.")
-    except Exception as e:
-        print(f"[ERROR] Ошибка при обновлении сигнатур: {e}")
-    finally:
-        conn.close()
 
 # Обновление базы сигнатур через API
 def update_signatures():
+    url = 'https://mb-api.abuse.ch/api/v1/'
+    params = {
+        'api_key': '0a334b04a09f6d0010e09f2789a9958d',
+        'action': 'get_info'
+    }
     print("[INFO] Обновление сигнатур через API...")
-    signatures = fetch_signatures_from_api()  # Получаем сигнатуры
-    if signatures:
-        update_signatures_in_db(signatures)  # Обновляем базу данных
-    else:
-        print("[INFO] Нет новых сигнатур для обновления.")
+    try:
+        response = requests.post(url, data=params)
+        update()
+        data = response.json()
+        if response.status_code == 200 and data.get('success'):
+            signatures = extract_signatures(data)
+            if signatures:
+                update_signatures_in_db(signatures)
+    except requests.exceptions.RequestException as e:
+        print(f"[ERROR] Ошибка API: {e}")
 
 # Функция для GUI кнопки "Update"
 def update_database():
-    update_signatures()  # Запускаем обновление базы через API
+    update_signatures()
     messagebox.showinfo("Update", "База сигнатур успешно обновлена.")
 
-# Планировщик обновления каждые 24 часа
-schedule.every(24).hours.do(update_signatures)
+# Функция для мониторинга процессов
+def monitor_processes():
+    clear_content()	
+    process_label = tk.Label(main_content, text="Активные процессы", font=("Arial", 18), bg="#3a4750")
+    process_label.pack(pady=10)
+    process_text = scrolledtext.ScrolledText(main_content, width=90, height=20, wrap=tk.WORD)
+    process_text.pack(pady=10)
+    for proc in psutil.process_iter(['pid', 'name', 'username']):
+        try:
+            process_info = f"PID: {proc.info['pid']}, Имя: {proc.info['name']}, Пользователь: {proc.info['username']}"
+            process_text.insert(tk.END, process_info + "\n")
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            pass
+            
+def get_quarantine_logs():
+    conn = connect_db()
+    if conn is None:
+        return []
 
-# Основной цикл обновления
-def run_scheduler():
-    while True:
-        schedule.run_pending()
-        time.sleep(1)
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT file_path, date_quarantined, status FROM quarantine WHERE status = 'active';")
+            logs = cur.fetchall()
+            
+            return logs
+    except Exception as e:
+        print(f"Ошибка при чтении данных: {e}")
+        return []
+    finally:
+        conn.close()
 
-# GUI Функции для работы кнопок
-def choose_directory():
-    directory = filedialog.askdirectory()
-    if directory:
-        scan_files(directory)
+def send_logs_to_rabbitmq():
+    logs = get_quarantine_logs()
 
+    if not logs:
+        print("Нет данных для отправки.")
+        return
+
+    # Инициализируем RabbitMQ клиент
+    
+    
+    rabbitmq = RabbitMQClient()
+    rabbitmq.connect()
+
+    # Отправляем каждый лог в очередь RabbitMQ
+    for log in logs:
+        file_path, date_quarantined, status = log
+        message_to_send = {
+            "file_path": file_path,
+            "date_quarantined": date_quarantined.isoformat(),
+            "status": status,
+            "scanner": "antivirus"
+        }
+        rabbitmq.send_message(message_to_send)
+
+    # Закрываем соединение с RabbitMQ
+    
+    
+send_logs_to_rabbitmq()
+    
+
+# Функция для отображения главной страницы
 def show_home():
     clear_content()
 
-    # Загрузка изображения
-    image_path = "/home/kali/Desktop/antivirus/pic1.png"  # Укажите правильный путь к изображению
-    img = Image.open(image_path)
-    img = img.resize((400, 300), Image.LANCZOS)  # Изменение размера изображения
-    photo = ImageTk.PhotoImage(img)
+    # Загрузка фонового изображения
+    bg_image_path = "/home/kali/Desktop/antivirus/background_image.png"
 
-    home_label = tk.Label(main_content, text="Добро пожаловать в Security Guard - Antivirus", font=("Arial", 18), bg="white")
+    # Создаем объект изображения
+    bg_img = Image.open(bg_image_path)
+
+    # Получаем текущие размеры окна
+    window_width = root.winfo_width()
+    window_height = root.winfo_height()
+
+    # Масштабируем изображение до размеров окна
+    bg_img = bg_img.resize((window_width, window_height), Image.Resampling.LANCZOS)
+    bg_photo = ImageTk.PhotoImage(bg_img)
+
+    # Создание метки для фонового изображения
+    bg_label = tk.Label(main_content, image=bg_photo)
+    bg_label.image = bg_photo  # Сохранение ссылки на изображение
+    bg_label.place(relwidth=1, relheight=1)  # Растягиваем на всю ширину и высоту
+
+    # Добавление приветственного текста
+    home_label = tk.Label(
+        main_content,
+        text="Добро пожаловать в Security Guard - Antivirus",
+        font=("Arial", 18),
+        bg="#3a4750",
+        fg="white",
+    )
+    
     home_label.pack(pady=20)
+ 
+    shield_image_path = "/home/kali/Desktop/antivirus/1.jpg"  # Путь к изображению щита
+    shield_img = Image.open(shield_image_path).convert("RGBA")
+    shield_img = shield_img.resize((100, 100), Image.Resampling.LANCZOS)  # Изменяем размер изображения
+    shield_photo = ImageTk.PhotoImage(shield_img)
 
-    # Добавление изображения
-    image_label = tk.Label(main_content, image=photo, bg="white")
-    image_label.image = photo  # Сохранение ссылки на изображение
-    image_label.pack(pady=10)
+    shield_label = tk.Label(main_content, image=shield_photo, bg="#3a4750")
+    shield_label.image = shield_photo  # Сохранение ссылки на изображение
+    shield_label.pack(pady=(10, 0))  # Добавление отступа сверху, без отступа снизу
+
+    protected_text_label = tk.Label(
+        main_content,
+        text="Вы защищены",
+        font=("Arial", 24),
+        bg="#3a4750",
+        fg="white",
+    )
+    protected_text_label.pack(pady=(0, 20))  # Добавление отступа снизу
+
+    # Создаем контейнер для графиков
+    graph_frame = tk.Frame(main_content, bg="#3a4750")
+    graph_frame.pack(fill="x",side="bottom", expand=False, pady=(0,10))
+
+    # Инициализация данных
+    time_data = ["1PM", "2PM", "3PM", "4PM", "5PM", "6PM", "7PM"]
+    energy_data = [50] * len(time_data)  # Потребление процессора
+
+    # Создание первого графика (потребление электроэнергии устройства / загрузка CPU)
+    fig1, ax1 = plt.subplots(figsize=(4, 2), dpi=100, facecolor='none')
+    line, = ax1.plot(time_data, energy_data, marker="o", color="black")
+    
+    ax1.set_title("CPU (%)")
+    ax1.set_xlabel("Time")
+    ax1.set_ylabel("Use (%)")
+    ax1.set_facecolor('none')
+    ax1.set_ylim(0, 100)
+    fig1.patch.set_alpha(0.0)
+
+    # Встраивание графика в Tkinter
+    chart1 = FigureCanvasTkAgg(fig1, graph_frame)
+    chart1.get_tk_widget().pack(side="left", expand=True)
+
+    # Создание второго графика (использование ОЗУ)
+    fig2, ax2 = plt.subplots(figsize=(4, 2), dpi=100, facecolor='none')
+    ram_usage = psutil.virtual_memory()
+    sizes = [ram_usage.used / (1024 ** 3), ram_usage.available / (1024 ** 3)]
+    labels = ["Using", "Free"]
+    colors = ["red", "green"]
+    fig2.patch.set_alpha(0.0)
+    pie = ax2.pie(sizes, labels=labels, autopct="%1.1f%%", startangle=90, colors=colors)
+    ax2.set_title("Using RAM")
+    ax2.set_facecolor('none')
+    
+
+    # Встраивание диаграммы в Tkinter
+    chart2 = FigureCanvasTkAgg(fig2, graph_frame)
+    chart2.get_tk_widget().pack(side="left", expand=True)
+
+    # Функция для обновления данных
+    def update_data():
+        # Обновление данных для первого графика
+        cpu_usage = psutil.cpu_percent(interval=0.1)  # Загрузка процессора
+        energy_data.pop(0)
+        energy_data.append(cpu_usage)
+        line.set_ydata(energy_data)
+        fig1.canvas.draw()
+
+        # Обновление данных для второго графика
+        ram_usage = psutil.virtual_memory()
+        sizes = [ram_usage.used / (1024 ** 3), ram_usage.available / (1024 ** 3)]
+        for wedge, size in zip(pie[0], sizes):
+            wedge.set_theta1(size)
+        fig2.canvas.draw()
+
+        # Запланировать следующий апдейт
+        main_content.after(1000, update_data)
+
+    # Запуск обновления данных
+    update_data()
+
+# Функция для обновления интерфейса при изменении размера окна
+def on_resize(event):
+    show_home()
+    
+# Функция для мониторинга сетевой активности
+def monitor_network():
+    clear_content()
+    network_label = tk.Label(main_content, text="Сетевая активность", font=("Arial", 18), bg="#3a4750")
+    network_label.pack(pady=10)
+    network_text = scrolledtext.ScrolledText(main_content, width=90, height=20, wrap=tk.WORD)
+    network_text.pack(pady=10)
+    for conn in psutil.net_connections(kind='inet'):
+        if conn.status == 'ESTABLISHED':
+            try:
+                local_address = f"{conn.laddr.ip}:{conn.laddr.port}"
+                remote_address = f"{conn.raddr.ip}:{conn.raddr.port}" if conn.raddr else "N/A"
+                connection_info = f"Локальный адрес: {local_address}, Удаленный адрес: {remote_address}, Статус: {conn.status}"
+                network_text.insert(tk.END, connection_info + "\n")
+            except Exception as e:
+                network_text.insert(tk.END, f"Ошибка получения данных: {e}\n")
+
+def clear_content():
+    # Удаление всех виджетов с основного контента
+    for widget in main_content.winfo_children():
+        widget.destroy()
+
+def show_support():
+    clear_content()
+    support_label = tk.Label(main_content, text="Поддержка SG - Antivirus", font=("Arial", 18), bg="#3a4750")
+    support_label.pack(pady=20)
+
+    contact_label = tk.Label(main_content, text="Для технической поддержки обратитесь:", bg="#3a4750")
+    contact_label.pack()
+
+    email_label = tk.Label(main_content, text="Email: support@secguard.com", font=("Arial", 12), bg="#3a4750")
+    email_label.pack(pady=10)
+
+    phone_label = tk.Label(main_content, text="Телефон: +7 (747) 483-34-72", font=("Arial", 12), bg="#3a4750")
+    phone_label.pack(pady=10)
 
 def show_settings():
     clear_content()
-    settings_label = tk.Label(main_content, text="Настройки", font=("Arial", 18), bg="white")
+    settings_label = tk.Label(main_content, text="Настройки", font=("Arial", 18), bg="#3a4750")
     settings_label.pack(pady=20)
 
-    db_label = tk.Label(main_content, text="Настройки базы данных:", font=("Arial", 14), bg="white")
+    db_label = tk.Label(main_content, text="Настройки базы данных:", font=("Arial", 14), bg="#3a4750")
     db_label.pack(pady=10)
 
-    db_name_label = tk.Label(main_content, text="Имя базы данных:", bg="white")
+    db_name_label = tk.Label(main_content, text="Имя базы данных:", bg="#3a4750")
     db_name_label.pack()
     db_name_entry = tk.Entry(main_content)
     db_name_entry.pack()
 
-    user_label = tk.Label(main_content, text="Имя пользователя:", bg="white")
+    user_label = tk.Label(main_content, text="Имя пользователя:", bg="#3a4750")
     user_label.pack()
     user_entry = tk.Entry(main_content)
     user_entry.pack()
 
-    password_label = tk.Label(main_content, text="Пароль:", bg="white")
+    password_label = tk.Label(main_content, text="Пароль:", bg="#3a4750")
     password_label.pack()
     password_entry = tk.Entry(main_content, show="*")
     password_entry.pack()
 
-    host_label = tk.Label(main_content, text="Хост:", bg="white")
+    host_label = tk.Label(main_content, text="Хост:", bg="#3a4750")
     host_label.pack()
     host_entry = tk.Entry(main_content)
     host_entry.pack()
 
-    port_label = tk.Label(main_content, text="Порт:", bg="white")
+    port_label = tk.Label(main_content, text="Порт:", bg="#3a4750")
     port_label.pack()
     port_entry = tk.Entry(main_content)
     port_entry.pack()
@@ -269,59 +426,51 @@ def show_settings():
     save_button = tk.Button(main_content, text="Сохранить настройки", bg="#f0f0f0", command=lambda: messagebox.showinfo("Настройки", "Настройки сохранены"))
     save_button.pack(pady=20)
 
-def show_support():
-    clear_content()
-    support_label = tk.Label(main_content, text="Поддержка SG - Antivirus", font=("Arial", 18), bg="white")
-    support_label.pack(pady=20)
 
-    contact_label = tk.Label(main_content, text="Для технической поддержки обратитесь:", bg="white")
-    contact_label.pack()
-
-    email_label = tk.Label(main_content, text="Email: support@secguard.com", font=("Arial", 12), bg="white")
-    email_label.pack(pady=10)
-
-    phone_label = tk.Label(main_content, text="Телефон: +7 (747) 483-34-72", font=("Arial", 12), bg="white")
-    phone_label.pack(pady=10)
-
-def clear_content():
-    # Удаление всех виджетов с основного контента
-    for widget in main_content.winfo_children():
-        widget.destroy()
-
-# Создание GUI
 root = tk.Tk()
 root.title("Security Guard - Antivirus")
 root.geometry("800x500")
 
-# Боковая панель
-sidebar = tk.Frame(root, width=200, bg="#e0e0e0")
+# Боковая панель с Canvas для прозрачности
+sidebar = tk.Canvas(root, width=210, bg="#303841", highlightthickness=0)
 sidebar.pack(side="left", fill="y")
 
-# Основная область
-main_content = tk.Frame(root, bg="white")
+# Основная область с Canvas для основного содержимого
+main_content = tk.Canvas(root, bg="#3a4750", highlightthickness=0)
 main_content.pack(side="right", expand=True, fill="both")
 
-# Добавление кнопок на боковую панель
-logo = tk.Label(sidebar, text="Security Guard", bg="#e0e0e0", font=("Arial", 16, "bold"))
-logo.pack(pady=20)
+# Логотип и заголовок приложения
+sidebar.create_text(100, 40, text="Security Guard", font=("Arial", 20, "bold"), fill="lightblue")
 
-home_button = tk.Button(sidebar, text="Home", width=20, bg="#f0f0f0", command=show_home)
-home_button.pack(pady=10)
 
-scan_button = tk.Button(sidebar, text="File Scan", command=choose_directory, width=20, bg="#f0f0f0")
-scan_button.pack(pady=10)
 
-update_button = tk.Button(sidebar, text="Update Signatures", width=20, bg="#f0f0f0", command=update_database)
-update_button.pack(pady=10)
+# Кнопки на боковой панели
+buttons = [
+    ("Home", show_home),
+    ("File Scan", lambda: filedialog.askdirectory()),
+    ("Update Signatures", update_database),
+    ("Process Monitor", monitor_processes),
+    ("Network Monitor", monitor_network),
+    ("Settings", show_settings),
+    ("Support", show_support)
+]
 
-settings_button = tk.Button(sidebar, text="Settings", width=20, bg="#f0f0f0", command=show_settings)
-settings_button.pack(pady=10)
+# Создание кнопок с использованием Canvas и настройкой полупрозрачного фона
+y_pos = 100
+for (text, command) in buttons:
+    button = tk.Button(root, text=text, width=20, font=("Arial", 12), command=command, 
+                       bg="#3a4750", fg="white", activebackground="#465661", relief="flat")
+    sidebar.create_window(100, y_pos, window=button)
+    y_pos += 50
+# Функция для очистки контента
+def clear_content():
+    for widget in main_content.winfo_children():
+        widget.destroy()
 
-support_button = tk.Button(sidebar, text="Support", width=20, bg="#f0f0f0", command=show_support)
-support_button.pack(pady=10)
-
-# Отображение начального экрана
 show_home()
+# Обработчик изменения размера окна
+root.after(100, show_home)
+
 
 # Запуск основного цикла приложения
 root.mainloop()
